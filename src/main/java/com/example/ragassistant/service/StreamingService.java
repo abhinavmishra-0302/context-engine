@@ -10,6 +10,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.core.context.SecurityContext;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -28,7 +30,16 @@ public class StreamingService {
             throw new AppException(HttpStatus.BAD_REQUEST, "query must not be blank");
         }
         SseEmitter emitter = new SseEmitter(0L);
-        streamingTaskExecutor.execute(() -> runStreamingQuery(emitter, query, sessionId, documentIds));
+        SecurityContext securityContext = SecurityContextHolder.getContext();
+        streamingTaskExecutor.execute(() -> {
+            SecurityContext previous = SecurityContextHolder.getContext();
+            try {
+                SecurityContextHolder.setContext(securityContext);
+                runStreamingQuery(emitter, query, sessionId, documentIds);
+            } finally {
+                SecurityContextHolder.setContext(previous);
+            }
+        });
         return emitter;
     }
 

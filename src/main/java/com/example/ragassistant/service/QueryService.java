@@ -3,6 +3,8 @@ package com.example.ragassistant.service;
 import com.example.ragassistant.dto.QueryRequest;
 import com.example.ragassistant.dto.QueryResponse;
 import com.example.ragassistant.exception.AppException;
+import com.example.ragassistant.model.ChatMessage;
+import com.example.ragassistant.model.ChatSession;
 import com.example.ragassistant.model.Document;
 import com.example.ragassistant.model.DocumentChunk;
 import com.example.ragassistant.model.DocumentStatus;
@@ -24,8 +26,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
@@ -33,6 +37,7 @@ import org.springframework.stereotype.Service;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class QueryService {
 
     private static final String CACHE_PREFIX = "rag:answer:";
@@ -43,6 +48,8 @@ public class QueryService {
     private final VectorStore vectorStore;
     private final GeminiService geminiService;
     private final ChatHistoryService chatHistoryService;
+    private final ChatMemoryService chatMemoryService;
+    private final CitationService citationService;
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
 
@@ -52,31 +59,63 @@ public class QueryService {
     @Value("${app.rag.cache-ttl-hours}")
     private long cacheTtlHours;
 
-    public QueryResponse answer(QueryRequest request) {
-        User user = currentUserService.getCurrentUser();
-        List<Document> documents = validateDocuments(user, request.documentIds());
+    @Value("${app.rag.max-context-chars-per-chunk:1400}")
+    private int maxContextCharsPerChunk;
 
-        String cacheKey = cacheKey(user.getId(), request.query(), request.documentIds());
+    public QueryResponse answer(QueryRequest request) {
+        return answerInternal(request, null);
+    }
+
+    public QueryResponse answerStreaming(QueryRequest request, Consumer<String> tokenConsumer) {
+        return answerInternal(request, tokenConsumer);
+    }
+
+    private QueryResponse answerInternal(QueryRequest request, Consumer<String> tokenConsumer) {
+        long overallStart = System.nanoTime();
+        User user = currentUserService.getCurrentUser();
+        List<Document> documents = resolveDocuments(user, request.documentIds());
+        ChatSession session = resolveSession(user, request.sessionId());
+        List<ChatMessage> history = session == null ? List.of() : chatMemoryService.loadRecentMessages(session);
+
+        List<UUID> resolvedDocumentIds = documents.stream().map(Document::getId).toList();
+        String cacheKey = cacheKey(user.getId(), request.query(), resolvedDocumentIds, request.sessionId());
         String cached = redisTemplate.opsForValue().get(cacheKey);
         if (cached != null) {
             QueryResponse response = deserialize(cached);
-            chatHistoryService.save(user, request.query(), response.answer());
-            return response;
+            if (response != null) {
+                log.info("Cache hit for query");
+                if (tokenConsumer != null && !response.answer().isBlank()) {
+                    tokenConsumer.accept(response.answer());
+                }
+                persistResponse(user, session, request.query(), response.answer());
+                return response;
+            }
+            redisTemplate.delete(cacheKey);
         }
+        log.info("Cache miss for query");
 
+        long retrievalStart = System.nanoTime();
         List<Float> queryEmbedding = embeddingService.embedText(request.query());
         Set<String> allowedDocumentIds = documents.stream()
                 .map(doc -> doc.getId().toString())
                 .collect(Collectors.toCollection(LinkedHashSet::new));
         List<VectorSearchResult> results = vectorStore.search(queryEmbedding, topK, allowedDocumentIds);
+        long retrievalMs = elapsedMs(retrievalStart);
         if (results.isEmpty()) {
             QueryResponse empty = new QueryResponse("I could not find relevant context in the selected documents.", List.of());
             cache(cacheKey, empty);
-            chatHistoryService.save(user, request.query(), empty.answer());
+            persistResponse(user, session, request.query(), empty.answer());
+            if (tokenConsumer != null) {
+                tokenConsumer.accept(empty.answer());
+            }
+            log.info("Query completed with no results in {} ms", elapsedMs(overallStart));
             return empty;
         }
 
-        List<UUID> chunkIds = results.stream().map(result -> UUID.fromString(result.id())).toList();
+        List<UUID> chunkIds = results.stream()
+                .map(result -> parseUuid(result.id()))
+                .filter(id -> id != null)
+                .toList();
         Map<UUID, DocumentChunk> chunkMap = new HashMap<>();
         documentChunkRepository.findAllById(chunkIds).forEach(chunk -> chunkMap.put(chunk.getId(), chunk));
 
@@ -84,30 +123,64 @@ public class QueryService {
                 .map(chunkMap::get)
                 .filter(chunk -> chunk != null)
                 .toList();
-        String context = buildContext(orderedChunks);
-        String prompt = """
-                You are a helpful assistant. Answer the question based only on the provided context.
+        if (orderedChunks.isEmpty()) {
+            QueryResponse empty = new QueryResponse("I could not find relevant context in the selected documents.", List.of());
+            cache(cacheKey, empty);
+            persistResponse(user, session, request.query(), empty.answer());
+            if (tokenConsumer != null) {
+                tokenConsumer.accept(empty.answer());
+            }
+            log.info("Query completed with no persisted chunks in {} ms", elapsedMs(overallStart));
+            return empty;
+        }
 
-                Context:
+        String context = buildRetrievedContext(orderedChunks);
+        String conversationHistory = session == null ? "None" : chatMemoryService.formatConversationHistory(history);
+        String prompt = """
+                You are a helpful assistant.
+
+                Conversation History:
+                %s
+
+                Retrieved Context:
                 %s
 
                 Question:
                 %s
 
                 Answer clearly and concisely.
-                """.formatted(context, request.query());
+                """.formatted(conversationHistory, context, request.query());
 
-        String answer = geminiService.generateAnswer(prompt);
-        List<String> sources = orderedChunks.stream()
-                .map(chunk -> chunk.getDocument().getId() + ":" + chunk.getChunkIndex())
-                .toList();
-        QueryResponse response = new QueryResponse(answer, sources);
+        long llmStart = System.nanoTime();
+        String answer = tokenConsumer == null
+                ? geminiService.generateAnswer(prompt)
+                : geminiService.streamAnswer(prompt, tokenConsumer);
+        long llmMs = elapsedMs(llmStart);
+        QueryResponse response = new QueryResponse(answer, citationService.buildCitations(orderedChunks));
         cache(cacheKey, response);
-        chatHistoryService.save(user, request.query(), answer);
+        persistResponse(user, session, request.query(), answer);
+        log.info(
+                "Query completed in {} ms (retrieval={} ms, llm={} ms, docs={}, chunks={})",
+                elapsedMs(overallStart),
+                retrievalMs,
+                llmMs,
+                documents.size(),
+                orderedChunks.size()
+        );
         return response;
     }
 
-    private List<Document> validateDocuments(User user, List<UUID> documentIds) {
+    private List<Document> resolveDocuments(User user, List<UUID> documentIds) {
+        if (documentIds == null || documentIds.isEmpty()) {
+            List<Document> docs = documentRepository.findByUserOrderByCreatedAtDesc(user).stream()
+                    .filter(doc -> doc.getStatus() == DocumentStatus.READY)
+                    .toList();
+            if (docs.isEmpty()) {
+                throw new AppException(HttpStatus.BAD_REQUEST, "No READY documents available for current user");
+            }
+            return docs;
+        }
+
         List<Document> docs = documentRepository.findByIdInAndUser(documentIds, user);
         if (docs.size() != documentIds.size()) {
             throw new AppException(HttpStatus.BAD_REQUEST, "One or more documents are invalid");
@@ -118,17 +191,33 @@ public class QueryService {
         return docs;
     }
 
-    private String buildContext(List<DocumentChunk> chunks) {
+    private ChatSession resolveSession(User user, UUID sessionId) {
+        if (sessionId == null) {
+            return null;
+        }
+        return chatMemoryService.requireOwnedSession(user, sessionId);
+    }
+
+    private String buildRetrievedContext(List<DocumentChunk> chunks) {
         List<String> parts = new ArrayList<>();
         for (DocumentChunk chunk : chunks) {
-            parts.add("[" + chunk.getDocument().getId() + ":" + chunk.getChunkIndex() + "] " + chunk.getText());
+            String snippet = truncate(chunk.getText(), maxContextCharsPerChunk);
+            parts.add(
+                    "[doc=" + chunk.getDocument().getFileName()
+                            + ", page=" + chunk.getPageNumber()
+                            + ", chunk=" + chunk.getChunkIndex()
+                            + "] " + snippet
+            );
         }
         return String.join("\n\n", parts);
     }
 
-    private String cacheKey(UUID userId, String query, List<UUID> documentIds) {
+    private String cacheKey(UUID userId, String query, List<UUID> documentIds, UUID sessionId) {
         List<String> sortedIds = documentIds.stream().map(UUID::toString).sorted().toList();
-        String raw = userId + "|" + query.trim().toLowerCase(Locale.ROOT) + "|" + String.join(",", sortedIds);
+        String raw = userId
+                + "|" + query.trim().toLowerCase(Locale.ROOT)
+                + "|" + String.join(",", sortedIds)
+                + "|" + (sessionId == null ? "no-session" : sessionId.toString());
         return CACHE_PREFIX + sha256(raw);
     }
 
@@ -158,7 +247,37 @@ public class QueryService {
         try {
             return objectMapper.readValue(payload, QueryResponse.class);
         } catch (JsonProcessingException ex) {
-            throw new AppException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to parse cached response");
+            log.warn("Failed to parse cached response, cache entry will be ignored", ex);
+            return null;
         }
+    }
+
+    private void persistResponse(User user, ChatSession session, String query, String answer) {
+        chatHistoryService.save(user, query, answer);
+        if (session != null) {
+            chatMemoryService.saveTurn(session, query, answer);
+        }
+    }
+
+    private UUID parseUuid(String raw) {
+        try {
+            return UUID.fromString(raw);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private long elapsedMs(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000;
+    }
+
+    private String truncate(String text, int maxChars) {
+        if (text == null) {
+            return "";
+        }
+        if (text.length() <= maxChars) {
+            return text;
+        }
+        return text.substring(0, maxChars) + "...";
     }
 }

@@ -3,10 +3,16 @@ package com.example.ragassistant.service;
 import com.example.ragassistant.exception.AppException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Consumer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -21,6 +27,7 @@ public class GeminiService {
 
     private final ObjectMapper objectMapper;
     private final RestClient restClient = RestClient.builder().baseUrl("https://generativelanguage.googleapis.com/v1beta").build();
+    private final HttpClient httpClient = HttpClient.newHttpClient();
 
     @Value("${app.gemini.api-key}")
     private String apiKey;
@@ -112,6 +119,70 @@ public class GeminiService {
         }
     }
 
+    public String streamAnswer(String prompt, Consumer<String> tokenConsumer) {
+        requireApiKey();
+        try {
+            String modelName = normalizeModelName(chatModel);
+            String body = objectMapper.writeValueAsString(Map.of(
+                    "contents", List.of(
+                            Map.of(
+                                    "role", "user",
+                                    "parts", List.of(Map.of("text", prompt))
+                            )
+                    )
+            ));
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://generativelanguage.googleapis.com/v1beta/models/"
+                            + modelName + ":streamGenerateContent?alt=sse"))
+                    .header("x-goog-api-key", apiKey)
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                    .build();
+
+            HttpResponse<java.util.stream.Stream<String>> response =
+                    httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+            if (response.statusCode() >= 400) {
+                throw new AppException(HttpStatus.BAD_GATEWAY, "LLM streaming request failed");
+            }
+
+            StringBuilder answer = new StringBuilder();
+            try (java.util.stream.Stream<String> lines = response.body()) {
+                lines.forEach(line -> {
+                    String trimmed = line == null ? "" : line.trim();
+                    if (!trimmed.startsWith("data:")) {
+                        return;
+                    }
+                    String data = trimmed.substring("data:".length()).trim();
+                    if (data.isBlank()) {
+                        return;
+                    }
+                    String eventText = extractAnswerText(safeReadTree(data));
+                    if (eventText.isBlank()) {
+                        return;
+                    }
+                    String delta = eventText;
+                    String current = answer.toString();
+                    if (eventText.startsWith(current)) {
+                        delta = eventText.substring(current.length());
+                    } else if (current.endsWith(eventText)) {
+                        delta = "";
+                    }
+                    if (!delta.isBlank()) {
+                        tokenConsumer.accept(delta);
+                        answer.append(delta);
+                    }
+                });
+            }
+            return answer.toString();
+        } catch (AppException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            log.error("LLM streaming failed", ex);
+            throw new AppException(HttpStatus.BAD_GATEWAY, "Failed to stream answer from LLM");
+        }
+    }
+
     private void requireApiKey() {
         if (apiKey == null || apiKey.isBlank()) {
             throw new AppException(HttpStatus.BAD_REQUEST, "Gemini API key is not configured");
@@ -127,5 +198,37 @@ public class GeminiService {
             return clean.substring("models/".length());
         }
         return clean;
+    }
+
+    private JsonNode safeReadTree(String json) {
+        try {
+            return objectMapper.readTree(json);
+        } catch (Exception ex) {
+            return objectMapper.createObjectNode();
+        }
+    }
+
+    private String extractAnswerText(JsonNode node) {
+        if (node == null) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        JsonNode candidates = node.path("candidates");
+        if (!candidates.isArray()) {
+            return "";
+        }
+        for (JsonNode candidate : candidates) {
+            JsonNode parts = candidate.path("content").path("parts");
+            if (!parts.isArray()) {
+                continue;
+            }
+            for (JsonNode part : parts) {
+                String text = part.path("text").asText("");
+                if (!text.isBlank()) {
+                    builder.append(text);
+                }
+            }
+        }
+        return builder.toString();
     }
 }

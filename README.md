@@ -23,6 +23,9 @@ Spring Boot backend for a document-aware Q&A system:
 - `POST /documents/upload` (multipart: `file`)
 - `GET /documents`
 - `POST /query`
+- `GET /query/stream` (SSE)
+- `POST /chat/session`
+- `POST /chat/message`
 - `GET /chat/history`
 
 ## Security and Platform
@@ -65,6 +68,9 @@ GEMINI_CHAT_MODEL=gemini-2.5-flash
 VECTOR_PROVIDER=faiss
 RAG_TOP_K=5
 RAG_CACHE_TTL_HOURS=4
+RAG_MEMORY_MAX_MESSAGES=8
+RAG_MAX_CONTEXT_CHARS_PER_CHUNK=1400
+RAG_CITATION_SNIPPET_CHARS=220
 
 PINECONE_API_KEY=
 PINECONE_INDEX_HOST=
@@ -85,17 +91,31 @@ mvn spring-boot:run
 After the app is running, execute:
 
 ```bash
-./scripts/smoke-test.sh --file /absolute/path/to/your/document.txt
+./scripts/smoke-test.sh
 ```
 
-If you skip `--file`, the script auto-creates `/tmp/rag-smoke-test.txt`.
+This validates Tier-1 flows end-to-end:
+- multi-document query
+- conversational memory (session + follow-up)
+- source citations
+- SSE streaming
+- workspace query (without `documentIds`)
 
 Optional:
 ```bash
 BASE_URL=http://localhost:8080 QUERY_TEXT="Give me a short summary" ./scripts/smoke-test.sh
 ```
 
+Use your own files:
+```bash
+./scripts/smoke-test.sh --files /abs/doc1.txt,/abs/doc2.txt
+```
+
+Dedicated stream check:
+```bash
+TOKEN=<jwt> SESSION_ID=<uuid> DOCUMENT_IDS_CSV=<doc1>,<doc2> ./scripts/test-stream.sh
+```
+
 ## Notes
 - File parsing supports `.pdf`, `.txt`, `.md`, `.csv`.
-- Prompt template in query flow follows the provided spec.
-- Source references in response are returned as `documentId:chunkIndex`.
+- Query responses include typed citations (`documentId`, `documentName`, `chunkId`, `page`, `snippet`).

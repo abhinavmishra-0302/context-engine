@@ -36,6 +36,9 @@ app:
     vector-provider: ${VECTOR_PROVIDER:faiss}
     top-k: ${RAG_TOP_K:5}
     cache-ttl-hours: ${RAG_CACHE_TTL_HOURS:4}
+    memory-max-messages: ${RAG_MEMORY_MAX_MESSAGES:8}
+    max-context-chars-per-chunk: ${RAG_MAX_CONTEXT_CHARS_PER_CHUNK:1400}
+    citation-snippet-chars: ${RAG_CITATION_SNIPPET_CHARS:220}
   gemini:
     api-key: ${GEMINI_API_KEY:}
     embedding-model: ${GEMINI_EMBEDDING_MODEL:gemini-embedding-001}

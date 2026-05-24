@@ -45,27 +45,43 @@ public class DocumentProcessingService {
         }
         Document document = optional.get();
         try {
-            String rawText = textExtractionService.extract(filePath, document.getFileName());
-            List<String> chunks = textChunker.chunk(rawText, CHUNK_SIZE_WORDS, CHUNK_OVERLAP_WORDS);
-
             List<DocumentChunk> chunkEntities = new ArrayList<>();
-            for (int i = 0; i < chunks.size(); i++) {
-                chunkEntities.add(DocumentChunk.builder()
-                        .id(UUID.randomUUID())
-                        .document(document)
-                        .chunkIndex(i)
-                        .text(chunks.get(i))
-                        .build());
+            List<String> chunkPayloads = new ArrayList<>();
+            List<TextExtractionService.ExtractedPage> pages = textExtractionService.extractPages(filePath, document.getFileName());
+            int chunkIndex = 0;
+            for (TextExtractionService.ExtractedPage page : pages) {
+                List<String> pageChunks = textChunker.chunk(page.text(), CHUNK_SIZE_WORDS, CHUNK_OVERLAP_WORDS);
+                for (String pageChunk : pageChunks) {
+                    UUID chunkId = UUID.randomUUID();
+                    chunkEntities.add(DocumentChunk.builder()
+                            .id(chunkId)
+                            .chunkUuid(chunkId)
+                            .document(document)
+                            .chunkIndex(chunkIndex++)
+                            .pageNumber(page.pageNumber())
+                            .text(pageChunk)
+                            .build());
+                    chunkPayloads.add(pageChunk);
+                }
+            }
+            if (chunkEntities.isEmpty()) {
+                document.setStatus(DocumentStatus.FAILED);
+                documentRepository.save(document);
+                log.warn("Document {} did not produce any chunks", documentId);
+                return;
             }
             documentChunkRepository.saveAll(chunkEntities);
 
-            List<List<Float>> embeddings = embeddingService.embedBatch(chunks);
+            List<List<Float>> embeddings = embeddingService.embedBatch(chunkPayloads);
             List<VectorRecord> vectorRecords = new ArrayList<>();
             for (int i = 0; i < chunkEntities.size(); i++) {
                 DocumentChunk chunk = chunkEntities.get(i);
                 Map<String, Object> metadata = new HashMap<>();
                 metadata.put("document_id", documentId.toString());
+                metadata.put("document_name", document.getFileName());
+                metadata.put("chunk_id", chunk.getChunkUuid().toString());
                 metadata.put("chunk_index", chunk.getChunkIndex());
+                metadata.put("page_number", chunk.getPageNumber());
                 vectorRecords.add(new VectorRecord(
                         chunk.getId().toString(),
                         embeddings.get(i),
@@ -75,7 +91,7 @@ public class DocumentProcessingService {
             vectorStore.upsert(vectorRecords);
             document.setStatus(DocumentStatus.READY);
             documentRepository.save(document);
-            log.info("Document {} processed with {} chunks", documentId, chunks.size());
+            log.info("Document {} processed with {} chunks", documentId, chunkEntities.size());
         } catch (Exception ex) {
             log.error("Document processing failed for {}", documentId, ex);
             document.setStatus(DocumentStatus.FAILED);

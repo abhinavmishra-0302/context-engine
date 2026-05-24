@@ -1,0 +1,50 @@
+server:
+  port: 8080
+
+spring:
+  config:
+    import: optional:file:.env[.properties]
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/rag_assistant}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+  flyway:
+    enabled: true
+  servlet:
+    multipart:
+      max-file-size: 25MB
+      max-request-size: 25MB
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:change-me-change-me-change-me-change-me}
+    expiration-minutes: ${JWT_EXPIRATION_MINUTES:1440}
+  storage:
+    upload-dir: ${UPLOAD_DIR:uploads}
+  rag:
+    vector-provider: ${VECTOR_PROVIDER:faiss}
+    top-k: ${RAG_TOP_K:5}
+    cache-ttl-hours: ${RAG_CACHE_TTL_HOURS:4}
+  gemini:
+    api-key: ${GEMINI_API_KEY:}
+    embedding-model: ${GEMINI_EMBEDDING_MODEL:gemini-embedding-001}
+    chat-model: ${GEMINI_CHAT_MODEL:gemini-2.5-flash}
+  pinecone:
+    api-key: ${PINECONE_API_KEY:}
+    index-host: ${PINECONE_INDEX_HOST:}
+    namespace: ${PINECONE_NAMESPACE:default}
+
+logging:
+  level:
+    com.example.ragassistant: INFO

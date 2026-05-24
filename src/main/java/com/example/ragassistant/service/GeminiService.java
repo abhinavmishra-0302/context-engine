@@ -1,0 +1,131 @@
+package com.example.ragassistant.service;
+
+import com.example.ragassistant.exception.AppException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class GeminiService {
+
+    private final ObjectMapper objectMapper;
+    private final RestClient restClient = RestClient.builder().baseUrl("https://generativelanguage.googleapis.com/v1beta").build();
+
+    @Value("${app.gemini.api-key}")
+    private String apiKey;
+
+    @Value("${app.gemini.embedding-model}")
+    private String embeddingModel;
+
+    @Value("${app.gemini.chat-model}")
+    private String chatModel;
+
+    public List<List<Float>> createEmbeddings(List<String> inputs) {
+        requireApiKey();
+        try {
+            List<List<Float>> embeddings = new ArrayList<>();
+            String modelName = normalizeModelName(embeddingModel);
+            for (String input : inputs) {
+                JsonNode node = restClient.post()
+                        .uri("/models/{model}:embedContent", modelName)
+                        .header("x-goog-api-key", apiKey)
+                        .body(Map.of(
+                                "content", Map.of(
+                                        "parts", List.of(Map.of("text", input))
+                                )
+                        ))
+                        .retrieve()
+                        .body(JsonNode.class);
+                if (node == null || node.path("embedding").path("values").isMissingNode()) {
+                    throw new AppException(HttpStatus.BAD_GATEWAY, "Invalid embedding response from Gemini");
+                }
+                List<Float> vector = new ArrayList<>();
+                for (JsonNode valueNode : node.path("embedding").path("values")) {
+                    vector.add(valueNode.floatValue());
+                }
+                embeddings.add(vector);
+            }
+            return embeddings;
+        } catch (Exception ex) {
+            log.error("Embedding generation failed", ex);
+            throw new AppException(HttpStatus.BAD_GATEWAY, "Failed to generate embeddings");
+        }
+    }
+
+    public String generateAnswer(String prompt) {
+        requireApiKey();
+        try {
+            String modelName = normalizeModelName(chatModel);
+            JsonNode node = restClient.post()
+                    .uri("/models/{model}:generateContent", modelName)
+                    .header("x-goog-api-key", apiKey)
+                    .body(Map.of(
+                            "contents", List.of(
+                                    Map.of(
+                                            "role", "user",
+                                            "parts", List.of(Map.of("text", prompt))
+                                    )
+                            )
+                    ))
+                    .retrieve()
+                    .body(JsonNode.class);
+            if (node == null) {
+                throw new AppException(HttpStatus.BAD_GATEWAY, "Invalid response from LLM");
+            }
+            JsonNode candidates = node.path("candidates");
+            if (candidates.isArray() && !candidates.isEmpty()) {
+                StringBuilder builder = new StringBuilder();
+                for (JsonNode candidate : candidates) {
+                    JsonNode parts = candidate.path("content").path("parts");
+                    if (!parts.isArray()) {
+                        continue;
+                    }
+                    for (JsonNode part : parts) {
+                        String text = part.path("text").asText("");
+                        if (!text.isBlank()) {
+                            if (!builder.isEmpty()) {
+                                builder.append('\n');
+                            }
+                            builder.append(text);
+                        }
+                    }
+                }
+                if (!builder.isEmpty()) {
+                    return builder.toString();
+                }
+            }
+            return objectMapper.writeValueAsString(node);
+        } catch (Exception ex) {
+            log.error("LLM completion failed", ex);
+            throw new AppException(HttpStatus.BAD_GATEWAY, "Failed to generate answer from LLM");
+        }
+    }
+
+    private void requireApiKey() {
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new AppException(HttpStatus.BAD_REQUEST, "Gemini API key is not configured");
+        }
+    }
+
+    private String normalizeModelName(String modelName) {
+        String clean = Objects.requireNonNullElse(modelName, "").trim();
+        if (clean.isBlank()) {
+            throw new AppException(HttpStatus.BAD_REQUEST, "Gemini model is not configured");
+        }
+        if (clean.startsWith("models/")) {
+            return clean.substring("models/".length());
+        }
+        return clean;
+    }
+}

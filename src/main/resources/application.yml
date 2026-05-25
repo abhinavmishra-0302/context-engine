@@ -37,12 +37,16 @@ app:
     top-k: ${RAG_TOP_K:5}
     cache-ttl-hours: ${RAG_CACHE_TTL_HOURS:4}
     memory-max-messages: ${RAG_MEMORY_MAX_MESSAGES:8}
+    memory-max-chars-total: ${RAG_MEMORY_MAX_CHARS_TOTAL:3000}
+    memory-max-chars-per-message: ${RAG_MEMORY_MAX_CHARS_PER_MESSAGE:600}
     max-context-chars-per-chunk: ${RAG_MAX_CONTEXT_CHARS_PER_CHUNK:1400}
     citation-snippet-chars: ${RAG_CITATION_SNIPPET_CHARS:220}
   gemini:
     api-key: ${GEMINI_API_KEY:}
     embedding-model: ${GEMINI_EMBEDDING_MODEL:gemini-embedding-001}
     chat-model: ${GEMINI_CHAT_MODEL:gemini-2.5-flash}
+    max-retries: ${GEMINI_MAX_RETRIES:2}
+    retry-backoff-ms: ${GEMINI_RETRY_BACKOFF_MS:600}
   pinecone:
     api-key: ${PINECONE_API_KEY:}
     index-host: ${PINECONE_INDEX_HOST:}

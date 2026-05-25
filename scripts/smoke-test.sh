@@ -11,6 +11,8 @@ POLL_ATTEMPTS="${POLL_ATTEMPTS:-40}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-2}"
 STREAM_MAX_SECONDS="${STREAM_MAX_SECONDS:-20}"
 TEST_WORKSPACE_QUERY="${TEST_WORKSPACE_QUERY:-1}"
+WORKSPACE_QUERY_RETRIES="${WORKSPACE_QUERY_RETRIES:-3}"
+PRINT_TOKEN="${PRINT_TOKEN:-0}"
 
 usage() {
   cat <<'EOF'
@@ -29,6 +31,7 @@ Options:
   --files CSV of absolute file paths (default: auto-generates 2 sample docs in /tmp)
   --email user email (default: generated)
   --password auth password
+  --print-token print JWT token and stream-ready variables at end
   --no-workspace-query skip query without documentIds
   --help|-h
 
@@ -39,14 +42,27 @@ Environment overrides:
   POLL_ATTEMPTS=40
   POLL_INTERVAL_SECONDS=2
   STREAM_MAX_SECONDS=20
+  WORKSPACE_QUERY_RETRIES=3
+  PRINT_TOKEN=1
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --files)
-      FILES_CSV="${2:-}"
-      shift 2
+      shift
+      file_args=()
+      while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+        file_args+=("$1")
+        shift
+      done
+      if [[ "${#file_args[@]}" -gt 0 ]]; then
+        if [[ -n "$FILES_CSV" ]]; then
+          FILES_CSV="${FILES_CSV},$(IFS=,; echo "${file_args[*]}")"
+        else
+          FILES_CSV="$(IFS=,; echo "${file_args[*]}")"
+        fi
+      fi
       ;;
     --email)
       EMAIL="${2:-}"
@@ -55,6 +71,10 @@ while [[ $# -gt 0 ]]; do
     --password)
       PASSWORD="${2:-}"
       shift 2
+      ;;
+    --print-token)
+      PRINT_TOKEN="1"
+      shift 1
       ;;
     --no-workspace-query)
       TEST_WORKSPACE_QUERY="0"
@@ -141,7 +161,13 @@ trap cleanup EXIT
 declare -a FILE_PATHS=()
 
 if [[ -n "$FILES_CSV" ]]; then
-  IFS=',' read -r -a FILE_PATHS <<< "$FILES_CSV"
+  IFS=',' read -r -a raw_paths <<< "$FILES_CSV"
+  for raw in "${raw_paths[@]}"; do
+    trimmed="$(echo "$raw" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    if [[ -n "$trimmed" ]]; then
+      FILE_PATHS+=("$trimmed")
+    fi
+  done
 else
   cat > "$TMP_DIR/doc_jvm.txt" <<'EOF'
 The JVM manages memory using heap and stack regions.
@@ -268,8 +294,20 @@ echo "==> Chat memory flow OK (2 turns)"
 
 if [[ "$TEST_WORKSPACE_QUERY" == "1" ]]; then
   workspace_query_payload="$(jq -cn --arg sid "$session_id" --arg q "Summarize all available documents in this workspace." '{query:$q,sessionId:$sid}')"
-  workspace_query_response="$(request POST "$BASE_URL/query" "$workspace_query_payload" "$token")"
-  workspace_answer="$(echo "$workspace_query_response" | jq -r '.answer // empty')"
+  workspace_answer=""
+  workspace_query_response=""
+  for ((attempt=1; attempt<=WORKSPACE_QUERY_RETRIES; attempt++)); do
+    workspace_query_response="$(request POST "$BASE_URL/query" "$workspace_query_payload" "$token")"
+    workspace_answer="$(echo "$workspace_query_response" | jq -r '.answer // empty')"
+    if [[ -n "$workspace_answer" ]]; then
+      break
+    fi
+    status_code="$(echo "$workspace_query_response" | jq -r '.status // empty')"
+    echo "   workspace query attempt $attempt/$WORKSPACE_QUERY_RETRIES failed (status=${status_code:-unknown})"
+    if [[ "$attempt" -lt "$WORKSPACE_QUERY_RETRIES" ]]; then
+      sleep 2
+    fi
+  done
   if [[ -z "$workspace_answer" ]]; then
     echo "Workspace query (without documentIds) failed"
     echo "Response: $workspace_query_response"
@@ -287,19 +325,26 @@ done
 
 stream_output_file="$TMP_DIR/stream.out"
 set +e
-timeout "$STREAM_MAX_SECONDS" curl -sS -N "$stream_url" -H "Authorization: Bearer $token" > "$stream_output_file"
+timeout "$STREAM_MAX_SECONDS" curl -sS -N --http1.1 "$stream_url" \
+  -H "Authorization: Bearer $token" \
+  -H "Accept: text/event-stream" > "$stream_output_file"
 stream_rc=$?
 set -e
 
-if [[ "$stream_rc" -ne 0 && "$stream_rc" -ne 124 ]]; then
+token_events="$(tr -d '\r' < "$stream_output_file" | grep -Ec '^event:[[:space:]]*token$' || true)"
+complete_events="$(tr -d '\r' < "$stream_output_file" | grep -Ec '^event:[[:space:]]*complete$' || true)"
+error_events="$(tr -d '\r' < "$stream_output_file" | grep -Ec '^event:[[:space:]]*error$' || true)"
+
+if [[ "$stream_rc" -ne 0 && "$stream_rc" -ne 124 && "$stream_rc" -ne 18 ]]; then
   echo "SSE call failed with code $stream_rc"
   cat "$stream_output_file"
   exit 1
 fi
 
-token_events="$(grep -c '^event: token' "$stream_output_file" || true)"
-complete_events="$(grep -c '^event: complete' "$stream_output_file" || true)"
-error_events="$(grep -c '^event: error' "$stream_output_file" || true)"
+if [[ "$stream_rc" -eq 18 && "$complete_events" -gt 0 && "$error_events" -eq 0 ]]; then
+  echo "==> SSE returned curl code 18 after completion event; treating as successful stream closure"
+fi
+
 if [[ "$token_events" -le 0 ]]; then
   echo "SSE did not emit token events"
   cat "$stream_output_file"
@@ -319,5 +364,16 @@ echo "===== SAMPLE CITATIONS ====="
 echo "$query_response" | jq '.sources'
 echo "===== STREAM PREVIEW ====="
 grep -E '^(event:|data:)' "$stream_output_file" | head -n 20 || true
+echo
+
+doc_ids_csv="$(IFS=,; echo "${DOC_IDS[*]}")"
+echo "===== STREAM TEST VARS ====="
+echo "SESSION_ID=$session_id"
+echo "DOCUMENT_IDS_CSV=$doc_ids_csv"
+if [[ "$PRINT_TOKEN" == "1" ]]; then
+  echo "TOKEN=$token"
+fi
+echo "Run:"
+echo "TOKEN=<jwt> SESSION_ID=$session_id DOCUMENT_IDS_CSV=$doc_ids_csv ./scripts/test-stream.sh"
 echo
 echo "Tier-1 smoke test completed successfully."

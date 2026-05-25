@@ -8,6 +8,7 @@ import com.example.ragassistant.model.User;
 import com.example.ragassistant.repository.ChatMessageRepository;
 import com.example.ragassistant.repository.ChatSessionRepository;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.List;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
@@ -26,6 +27,12 @@ public class ChatMemoryService {
 
     @Value("${app.rag.memory-max-messages:8}")
     private int memoryMaxMessages;
+
+    @Value("${app.rag.memory-max-chars-total:3000}")
+    private int memoryMaxCharsTotal;
+
+    @Value("${app.rag.memory-max-chars-per-message:600}")
+    private int memoryMaxCharsPerMessage;
 
     @Transactional
     public UUID createSessionForCurrentUser() {
@@ -74,13 +81,37 @@ public class ChatMemoryService {
         if (messages.isEmpty()) {
             return "None";
         }
-        StringBuilder builder = new StringBuilder();
-        for (ChatMessage message : messages) {
-            if (!builder.isEmpty()) {
-                builder.append('\n');
+
+        ArrayDeque<String> lines = new ArrayDeque<>();
+        int totalChars = 0;
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessage message = messages.get(i);
+            String content = truncate(message.getContent(), memoryMaxCharsPerMessage).replaceAll("\\s+", " ");
+            String line = message.getRole().name() + ": " + content;
+            if (lines.isEmpty() && line.length() > memoryMaxCharsTotal) {
+                lines.addFirst(truncate(line, memoryMaxCharsTotal));
+                break;
             }
-            builder.append(message.getRole().name()).append(": ").append(message.getContent());
+            if (totalChars + line.length() > memoryMaxCharsTotal) {
+                break;
+            }
+            lines.addFirst(line);
+            totalChars += line.length();
         }
-        return builder.toString();
+        if (lines.isEmpty()) {
+            return "None";
+        }
+        return String.join("\n", lines);
+    }
+
+    private String truncate(String text, int maxChars) {
+        if (text == null) {
+            return "";
+        }
+        String normalized = text.trim();
+        if (normalized.length() <= maxChars) {
+            return normalized;
+        }
+        return normalized.substring(0, maxChars) + "...";
     }
 }

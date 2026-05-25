@@ -19,6 +19,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 
 @Service
 @RequiredArgsConstructor
@@ -37,6 +38,12 @@ public class GeminiService {
 
     @Value("${app.gemini.chat-model}")
     private String chatModel;
+
+    @Value("${app.gemini.max-retries:2}")
+    private int maxRetries;
+
+    @Value("${app.gemini.retry-backoff-ms:600}")
+    private long retryBackoffMs;
 
     public List<List<Float>> createEmbeddings(List<String> inputs) {
         requireApiKey();
@@ -72,51 +79,62 @@ public class GeminiService {
 
     public String generateAnswer(String prompt) {
         requireApiKey();
-        try {
-            String modelName = normalizeModelName(chatModel);
-            JsonNode node = restClient.post()
-                    .uri("/models/{model}:generateContent", modelName)
-                    .header("x-goog-api-key", apiKey)
-                    .body(Map.of(
-                            "contents", List.of(
-                                    Map.of(
-                                            "role", "user",
-                                            "parts", List.of(Map.of("text", prompt))
-                                    )
-                            )
-                    ))
-                    .retrieve()
-                    .body(JsonNode.class);
-            if (node == null) {
-                throw new AppException(HttpStatus.BAD_GATEWAY, "Invalid response from LLM");
-            }
-            JsonNode candidates = node.path("candidates");
-            if (candidates.isArray() && !candidates.isEmpty()) {
-                StringBuilder builder = new StringBuilder();
-                for (JsonNode candidate : candidates) {
-                    JsonNode parts = candidate.path("content").path("parts");
-                    if (!parts.isArray()) {
-                        continue;
-                    }
-                    for (JsonNode part : parts) {
-                        String text = part.path("text").asText("");
-                        if (!text.isBlank()) {
-                            if (!builder.isEmpty()) {
-                                builder.append('\n');
+        String modelName = normalizeModelName(chatModel);
+        Exception lastError = null;
+        for (int attempt = 1; attempt <= maxRetries + 1; attempt++) {
+            try {
+                JsonNode node = restClient.post()
+                        .uri("/models/{model}:generateContent", modelName)
+                        .header("x-goog-api-key", apiKey)
+                        .body(Map.of(
+                                "contents", List.of(
+                                        Map.of(
+                                                "role", "user",
+                                                "parts", List.of(Map.of("text", prompt))
+                                        )
+                                )
+                        ))
+                        .retrieve()
+                        .body(JsonNode.class);
+                if (node == null) {
+                    throw new AppException(HttpStatus.BAD_GATEWAY, "Invalid response from LLM");
+                }
+                JsonNode candidates = node.path("candidates");
+                if (candidates.isArray() && !candidates.isEmpty()) {
+                    StringBuilder builder = new StringBuilder();
+                    for (JsonNode candidate : candidates) {
+                        JsonNode parts = candidate.path("content").path("parts");
+                        if (!parts.isArray()) {
+                            continue;
+                        }
+                        for (JsonNode part : parts) {
+                            String text = part.path("text").asText("");
+                            if (!text.isBlank()) {
+                                if (!builder.isEmpty()) {
+                                    builder.append('\n');
+                                }
+                                builder.append(text);
                             }
-                            builder.append(text);
                         }
                     }
+                    if (!builder.isEmpty()) {
+                        return builder.toString();
+                    }
                 }
-                if (!builder.isEmpty()) {
-                    return builder.toString();
+                return objectMapper.writeValueAsString(node);
+            } catch (Exception ex) {
+                lastError = ex;
+                boolean retry = attempt <= maxRetries && isRetryable(ex);
+                if (!retry) {
+                    break;
                 }
+                long sleepMs = retryBackoffMs * attempt;
+                log.warn("LLM completion attempt {} failed, retrying in {} ms", attempt, sleepMs);
+                sleepQuietly(sleepMs);
             }
-            return objectMapper.writeValueAsString(node);
-        } catch (Exception ex) {
-            log.error("LLM completion failed", ex);
-            throw new AppException(HttpStatus.BAD_GATEWAY, "Failed to generate answer from LLM");
         }
+        log.error("LLM completion failed", lastError);
+        throw new AppException(HttpStatus.BAD_GATEWAY, "Failed to generate answer from LLM");
     }
 
     public String streamAnswer(String prompt, Consumer<String> tokenConsumer) {
@@ -230,5 +248,24 @@ public class GeminiService {
             }
         }
         return builder.toString();
+    }
+
+    private boolean isRetryable(Exception ex) {
+        if (ex instanceof RestClientResponseException responseException) {
+            int code = responseException.getStatusCode().value();
+            return code == 429 || code >= 500;
+        }
+        if (ex instanceof AppException appException) {
+            return appException.getStatus().is5xxServerError();
+        }
+        return true;
+    }
+
+    private void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException interruptedException) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

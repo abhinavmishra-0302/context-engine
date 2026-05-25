@@ -3,7 +3,7 @@ set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
 TOKEN="${TOKEN:-}"
-QUERY="${QUERY:-Explain the selected documents briefly.}"
+QUERY="${QUERY:-Compare G1 and ZGC for low-latency services.}"
 SESSION_ID="${SESSION_ID:-}"
 DOCUMENT_IDS_CSV="${DOCUMENT_IDS_CSV:-}"
 MAX_SECONDS="${MAX_SECONDS:-30}"

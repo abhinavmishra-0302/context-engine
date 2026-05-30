@@ -25,6 +25,21 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:rag-assistant}
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.example.ragassistant.kafka.event"
+        spring.json.value.default.type: "com.example.ragassistant.kafka.event.DocumentUploadedEvent"
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    listener:
+      missing-topics-fatal: false
 
 app:
   jwt:
@@ -35,12 +50,23 @@ app:
   rag:
     vector-provider: ${VECTOR_PROVIDER:faiss}
     top-k: ${RAG_TOP_K:5}
-    cache-ttl-hours: ${RAG_CACHE_TTL_HOURS:4}
+    query-cache-ttl-hours: ${RAG_QUERY_CACHE_TTL_HOURS:6}
+    retrieval-cache-ttl-hours: ${RAG_RETRIEVAL_CACHE_TTL_HOURS:1}
+    document-cache-ttl-hours: ${RAG_DOCUMENT_CACHE_TTL_HOURS:24}
     memory-max-messages: ${RAG_MEMORY_MAX_MESSAGES:8}
     memory-max-chars-total: ${RAG_MEMORY_MAX_CHARS_TOTAL:3000}
     memory-max-chars-per-message: ${RAG_MEMORY_MAX_CHARS_PER_MESSAGE:600}
     max-context-chars-per-chunk: ${RAG_MAX_CONTEXT_CHARS_PER_CHUNK:1400}
     citation-snippet-chars: ${RAG_CITATION_SNIPPET_CHARS:220}
+    vector-weight: ${RAG_VECTOR_WEIGHT:0.7}
+    keyword-weight: ${RAG_KEYWORD_WEIGHT:0.3}
+    retrieval-top-k: ${RAG_RETRIEVAL_TOP_K:10}
+  kafka:
+    enabled: ${KAFKA_ENABLED:true}
+    topics:
+      document-uploaded: ${KAFKA_TOPIC_DOCUMENT_UPLOADED:document-uploaded}
+      document-processing-completed: ${KAFKA_TOPIC_DOCUMENT_PROCESSING_COMPLETED:document-processing-completed}
+      document-processing-failed: ${KAFKA_TOPIC_DOCUMENT_PROCESSING_FAILED:document-processing-failed}
   gemini:
     api-key: ${GEMINI_API_KEY:}
     embedding-model: ${GEMINI_EMBEDDING_MODEL:gemini-embedding-001}
@@ -55,3 +81,15 @@ app:
 logging:
   level:
     com.example.ragassistant: INFO
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    tags:
+      application: rag-assistant

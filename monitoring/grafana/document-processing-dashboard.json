@@ -1,0 +1,35 @@
+{
+  "title": "RAG Document Processing",
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Documents Uploaded",
+      "targets": [
+        {
+          "expr": "rate(documents_uploaded_total[5m])"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Documents Processed",
+      "targets": [
+        {
+          "expr": "rate(documents_processed_total[5m])"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Document Processing Duration (ms)",
+      "targets": [
+        {
+          "expr": "rate(document_processing_duration_ms_sum[5m]) / rate(document_processing_duration_ms_count[5m])"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

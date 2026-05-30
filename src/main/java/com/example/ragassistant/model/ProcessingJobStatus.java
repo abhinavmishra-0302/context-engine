@@ -1,8 +1,8 @@
 package com.example.ragassistant.model;
 
-public enum DocumentStatus {
+public enum ProcessingJobStatus {
     UPLOADED,
     PROCESSING,
-    READY,
+    COMPLETED,
     FAILED
 }

@@ -1,10 +1,16 @@
 package com.example.ragassistant.service;
 
+import com.example.ragassistant.kafka.DocumentUploadProducer;
+import com.example.ragassistant.kafka.event.DocumentUploadedEvent;
 import com.example.ragassistant.model.Document;
 import com.example.ragassistant.model.DocumentChunk;
+import com.example.ragassistant.model.DocumentProcessingJob;
 import com.example.ragassistant.model.DocumentStatus;
+import com.example.ragassistant.model.ProcessingJobStatus;
 import com.example.ragassistant.repository.DocumentChunkRepository;
 import com.example.ragassistant.repository.DocumentRepository;
+import com.example.ragassistant.repository.ProcessingJobRepository;
+import com.example.ragassistant.service.cache.CacheService;
 import com.example.ragassistant.service.vector.VectorRecord;
 import com.example.ragassistant.service.vector.VectorStore;
 import com.example.ragassistant.util.TextChunker;
@@ -17,7 +23,6 @@ import java.util.Optional;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -31,19 +36,36 @@ public class DocumentProcessingService {
 
     private final DocumentRepository documentRepository;
     private final DocumentChunkRepository documentChunkRepository;
+    private final ProcessingJobRepository processingJobRepository;
     private final TextExtractionService textExtractionService;
     private final TextChunker textChunker;
     private final EmbeddingService embeddingService;
     private final VectorStore vectorStore;
+    private final Optional<DocumentUploadProducer> documentUploadProducer;
+    private final CacheService cacheService;
 
-    @Async
     @Transactional
-    public void processDocumentAsync(UUID documentId, Path filePath) {
-        Optional<Document> optional = documentRepository.findById(documentId);
+    public void processUploadedDocument(DocumentUploadedEvent event) {
+        Optional<Document> optional = documentRepository.findById(event.documentId());
         if (optional.isEmpty()) {
             return;
         }
         Document document = optional.get();
+        Path filePath = Path.of(event.fileLocation());
+        DocumentProcessingJob job = processingJobRepository.findTopByDocumentOrderByCreatedAtDesc(document)
+                .orElseGet(() -> DocumentProcessingJob.builder()
+                        .id(UUID.randomUUID())
+                        .document(document)
+                        .createdAt(java.time.Instant.now())
+                        .build());
+        job.setStatus(ProcessingJobStatus.PROCESSING);
+        job.setErrorMessage(null);
+        job.setCompletedAt(null);
+        processingJobRepository.save(job);
+        document.setStatus(DocumentStatus.PROCESSING);
+        documentRepository.save(document);
+        cacheService.cacheDocumentMetadata(document);
+
         try {
             List<DocumentChunk> chunkEntities = new ArrayList<>();
             List<String> chunkPayloads = new ArrayList<>();
@@ -65,9 +87,7 @@ public class DocumentProcessingService {
                 }
             }
             if (chunkEntities.isEmpty()) {
-                document.setStatus(DocumentStatus.FAILED);
-                documentRepository.save(document);
-                log.warn("Document {} did not produce any chunks", documentId);
+                markFailed(document, job, "No chunks could be generated from document content");
                 return;
             }
             documentChunkRepository.saveAll(chunkEntities);
@@ -77,7 +97,7 @@ public class DocumentProcessingService {
             for (int i = 0; i < chunkEntities.size(); i++) {
                 DocumentChunk chunk = chunkEntities.get(i);
                 Map<String, Object> metadata = new HashMap<>();
-                metadata.put("document_id", documentId.toString());
+                metadata.put("document_id", document.getId().toString());
                 metadata.put("document_name", document.getFileName());
                 metadata.put("chunk_id", chunk.getChunkUuid().toString());
                 metadata.put("chunk_index", chunk.getChunkIndex());
@@ -91,11 +111,28 @@ public class DocumentProcessingService {
             vectorStore.upsert(vectorRecords);
             document.setStatus(DocumentStatus.READY);
             documentRepository.save(document);
-            log.info("Document {} processed with {} chunks", documentId, chunkEntities.size());
+            cacheService.cacheDocumentMetadata(document);
+            job.setStatus(ProcessingJobStatus.COMPLETED);
+            job.setCompletedAt(java.time.Instant.now());
+            processingJobRepository.save(job);
+            documentUploadProducer.ifPresent(producer ->
+                    producer.publishCompleted(document.getId(), document.getUser().getId(), chunkEntities.size()));
+            log.info("Document {} processed with {} chunks", document.getId(), chunkEntities.size());
         } catch (Exception ex) {
-            log.error("Document processing failed for {}", documentId, ex);
-            document.setStatus(DocumentStatus.FAILED);
-            documentRepository.save(document);
+            log.error("Document processing failed for {}", document.getId(), ex);
+            markFailed(document, job, ex.getMessage());
         }
+    }
+
+    private void markFailed(Document document, DocumentProcessingJob job, String errorMessage) {
+        document.setStatus(DocumentStatus.FAILED);
+        documentRepository.save(document);
+        cacheService.cacheDocumentMetadata(document);
+        job.setStatus(ProcessingJobStatus.FAILED);
+        job.setErrorMessage(errorMessage == null ? "Unknown processing error" : errorMessage);
+        job.setCompletedAt(java.time.Instant.now());
+        processingJobRepository.save(job);
+        documentUploadProducer.ifPresent(producer ->
+                producer.publishFailed(document.getId(), document.getUser().getId(), job.getErrorMessage()));
     }
 }

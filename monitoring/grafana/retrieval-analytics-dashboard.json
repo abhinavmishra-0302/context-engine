@@ -1,0 +1,26 @@
+{
+  "title": "RAG Retrieval Analytics",
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Hybrid Retrieval Duration (ms)",
+      "targets": [
+        {
+          "expr": "rate(retrieval_duration_ms_sum[5m]) / rate(retrieval_duration_ms_count[5m])"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "95th Percentile Retrieval (ms)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(retrieval_duration_ms_bucket[5m])) by (le))"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

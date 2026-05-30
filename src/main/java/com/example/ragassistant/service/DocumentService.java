@@ -3,16 +3,24 @@ package com.example.ragassistant.service;
 import com.example.ragassistant.dto.DocumentResponse;
 import com.example.ragassistant.dto.DocumentUploadResponse;
 import com.example.ragassistant.exception.AppException;
+import com.example.ragassistant.kafka.DocumentUploadProducer;
+import com.example.ragassistant.kafka.event.DocumentUploadedEvent;
 import com.example.ragassistant.model.Document;
+import com.example.ragassistant.model.DocumentProcessingJob;
 import com.example.ragassistant.model.DocumentStatus;
+import com.example.ragassistant.model.ProcessingJobStatus;
 import com.example.ragassistant.model.User;
 import com.example.ragassistant.repository.DocumentRepository;
+import com.example.ragassistant.repository.ProcessingJobRepository;
+import com.example.ragassistant.service.cache.CacheService;
+import com.example.ragassistant.service.monitoring.CustomMetricsService;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
@@ -26,7 +34,11 @@ public class DocumentService {
 
     private final CurrentUserService currentUserService;
     private final DocumentRepository documentRepository;
+    private final ProcessingJobRepository processingJobRepository;
     private final DocumentProcessingService documentProcessingService;
+    private final Optional<DocumentUploadProducer> documentUploadProducer;
+    private final CacheService cacheService;
+    private final CustomMetricsService customMetricsService;
 
     @Value("${app.storage.upload-dir}")
     private String uploadDir;
@@ -43,19 +55,33 @@ public class DocumentService {
                 .id(documentId)
                 .user(user)
                 .fileName(safeName)
-                .status(DocumentStatus.PROCESSING)
+                .status(DocumentStatus.UPLOADED)
                 .createdAt(Instant.now())
                 .build();
         documentRepository.save(document);
+        cacheService.cacheDocumentMetadata(document);
+        processingJobRepository.save(DocumentProcessingJob.builder()
+                .id(UUID.randomUUID())
+                .document(document)
+                .status(ProcessingJobStatus.UPLOADED)
+                .createdAt(Instant.now())
+                .build());
 
         Path savedFile = storeFile(documentId, safeName, file);
-        documentProcessingService.processDocumentAsync(documentId, savedFile);
-        return new DocumentUploadResponse(documentId, DocumentStatus.PROCESSING);
+        DocumentUploadedEvent event = new DocumentUploadedEvent(documentId, user.getId(), savedFile.toAbsolutePath().toString(), safeName);
+        if (documentUploadProducer.isPresent()) {
+            documentUploadProducer.get().publishUploaded(event);
+        } else {
+            documentProcessingService.processUploadedDocument(event);
+        }
+        customMetricsService.incrementDocumentsUploaded();
+        return new DocumentUploadResponse(documentId, DocumentStatus.UPLOADED);
     }
 
     public List<DocumentResponse> listCurrentUserDocuments() {
         User user = currentUserService.getCurrentUser();
         return documentRepository.findByUserOrderByCreatedAtDesc(user).stream()
+                .peek(cacheService::cacheDocumentMetadata)
                 .map(doc -> new DocumentResponse(doc.getId(), doc.getFileName(), doc.getStatus()))
                 .toList();
     }

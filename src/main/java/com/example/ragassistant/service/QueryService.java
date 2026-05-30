@@ -11,18 +11,15 @@ import com.example.ragassistant.model.DocumentStatus;
 import com.example.ragassistant.model.User;
 import com.example.ragassistant.repository.DocumentChunkRepository;
 import com.example.ragassistant.repository.DocumentRepository;
-import com.example.ragassistant.service.vector.VectorSearchResult;
-import com.example.ragassistant.service.vector.VectorStore;
-import com.fasterxml.jackson.core.JsonProcessingException;
+import com.example.ragassistant.service.cache.CacheService;
+import com.example.ragassistant.service.monitoring.CustomMetricsService;
+import com.example.ragassistant.service.retrieval.HybridRetrievalService;
+import com.example.ragassistant.service.retrieval.RetrievalScore;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -31,7 +28,6 @@ import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
@@ -40,24 +36,18 @@ import org.springframework.stereotype.Service;
 @Slf4j
 public class QueryService {
 
-    private static final String CACHE_PREFIX = "rag:answer:";
     private final CurrentUserService currentUserService;
     private final DocumentRepository documentRepository;
     private final DocumentChunkRepository documentChunkRepository;
     private final EmbeddingService embeddingService;
-    private final VectorStore vectorStore;
+    private final HybridRetrievalService hybridRetrievalService;
     private final GeminiService geminiService;
     private final ChatHistoryService chatHistoryService;
     private final ChatMemoryService chatMemoryService;
     private final CitationService citationService;
-    private final StringRedisTemplate redisTemplate;
+    private final CacheService cacheService;
+    private final CustomMetricsService customMetricsService;
     private final ObjectMapper objectMapper;
-
-    @Value("${app.rag.top-k}")
-    private int topK;
-
-    @Value("${app.rag.cache-ttl-hours}")
-    private long cacheTtlHours;
 
     @Value("${app.rag.max-context-chars-per-chunk:1400}")
     private int maxContextCharsPerChunk;
@@ -71,50 +61,47 @@ public class QueryService {
     }
 
     private QueryResponse answerInternal(QueryRequest request, Consumer<String> tokenConsumer) {
+        customMetricsService.incrementQueryCount();
+        UUID queryId = UUID.randomUUID();
         long overallStart = System.nanoTime();
         User user = currentUserService.getCurrentUser();
         List<Document> documents = resolveDocuments(user, request.documentIds());
         ChatSession session = resolveSession(user, request.sessionId());
         List<ChatMessage> history = session == null ? List.of() : chatMemoryService.loadRecentMessages(session);
-
         List<UUID> resolvedDocumentIds = documents.stream().map(Document::getId).toList();
-        String cacheKey = cacheKey(user.getId(), request.query(), resolvedDocumentIds, request.sessionId());
-        String cached = redisTemplate.opsForValue().get(cacheKey);
-        if (cached != null) {
-            QueryResponse response = deserialize(cached);
-            if (response != null) {
-                log.info("Cache hit for query");
-                if (tokenConsumer != null && !response.answer().isBlank()) {
-                    tokenConsumer.accept(response.answer());
-                }
-                persistResponse(user, session, request.query(), response.answer());
-                return response;
+        QueryResponse cachedResponse = cacheService.getCachedResponse(request.query(), request.sessionId(), resolvedDocumentIds)
+                .orElse(null);
+        if (cachedResponse != null) {
+            customMetricsService.incrementCacheHit();
+            if (tokenConsumer != null && !cachedResponse.answer().isBlank()) {
+                tokenConsumer.accept(cachedResponse.answer());
             }
-            redisTemplate.delete(cacheKey);
+            persistResponse(user, session, request.query(), cachedResponse.answer());
+            logStructured(queryId, user, request.sessionId(), resolvedDocumentIds, 0, 0, true, cachedResponse.answer().length(), elapsedMs(overallStart));
+            return cachedResponse;
         }
-        log.info("Cache miss for query");
+        customMetricsService.incrementCacheMiss();
 
         long retrievalStart = System.nanoTime();
         List<Float> queryEmbedding = embeddingService.embedText(request.query());
-        Set<String> allowedDocumentIds = documents.stream()
-                .map(doc -> doc.getId().toString())
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-        List<VectorSearchResult> results = vectorStore.search(queryEmbedding, topK, allowedDocumentIds);
+        Set<UUID> allowedDocumentIds = documents.stream().map(Document::getId).collect(Collectors.toCollection(LinkedHashSet::new));
+        List<RetrievalScore> results = hybridRetrievalService.retrieveChunks(request.query(), queryEmbedding, allowedDocumentIds);
         long retrievalMs = elapsedMs(retrievalStart);
+        customMetricsService.recordRetrievalDurationMs(retrievalMs);
+
         if (results.isEmpty()) {
             QueryResponse empty = new QueryResponse("I could not find relevant context in the selected documents.", List.of());
-            cache(cacheKey, empty);
+            cacheService.cacheResponse(request.query(), request.sessionId(), resolvedDocumentIds, empty);
             persistResponse(user, session, request.query(), empty.answer());
             if (tokenConsumer != null) {
                 tokenConsumer.accept(empty.answer());
             }
-            log.info("Query completed with no results in {} ms", elapsedMs(overallStart));
+            logStructured(queryId, user, request.sessionId(), resolvedDocumentIds, retrievalMs, 0, false, empty.answer().length(), elapsedMs(overallStart));
             return empty;
         }
 
         List<UUID> chunkIds = results.stream()
-                .map(result -> parseUuid(result.id()))
-                .filter(id -> id != null)
+                .map(RetrievalScore::chunkId)
                 .toList();
         Map<UUID, DocumentChunk> chunkMap = new HashMap<>();
         documentChunkRepository.findAllById(chunkIds).forEach(chunk -> chunkMap.put(chunk.getId(), chunk));
@@ -125,12 +112,12 @@ public class QueryService {
                 .toList();
         if (orderedChunks.isEmpty()) {
             QueryResponse empty = new QueryResponse("I could not find relevant context in the selected documents.", List.of());
-            cache(cacheKey, empty);
+            cacheService.cacheResponse(request.query(), request.sessionId(), resolvedDocumentIds, empty);
             persistResponse(user, session, request.query(), empty.answer());
             if (tokenConsumer != null) {
                 tokenConsumer.accept(empty.answer());
             }
-            log.info("Query completed with no persisted chunks in {} ms", elapsedMs(overallStart));
+            logStructured(queryId, user, request.sessionId(), resolvedDocumentIds, retrievalMs, 0, false, empty.answer().length(), elapsedMs(overallStart));
             return empty;
         }
 
@@ -156,17 +143,11 @@ public class QueryService {
                 ? geminiService.generateAnswer(prompt)
                 : geminiService.streamAnswer(prompt, tokenConsumer);
         long llmMs = elapsedMs(llmStart);
+        customMetricsService.recordLlmDurationMs(llmMs);
         QueryResponse response = new QueryResponse(answer, citationService.buildCitations(orderedChunks));
-        cache(cacheKey, response);
+        cacheService.cacheResponse(request.query(), request.sessionId(), resolvedDocumentIds, response);
         persistResponse(user, session, request.query(), answer);
-        log.info(
-                "Query completed in {} ms (retrieval={} ms, llm={} ms, docs={}, chunks={})",
-                elapsedMs(overallStart),
-                retrievalMs,
-                llmMs,
-                documents.size(),
-                orderedChunks.size()
-        );
+        logStructured(queryId, user, request.sessionId(), resolvedDocumentIds, retrievalMs, llmMs, false, answer.length(), elapsedMs(overallStart));
         return response;
     }
 
@@ -212,58 +193,10 @@ public class QueryService {
         return String.join("\n\n", parts);
     }
 
-    private String cacheKey(UUID userId, String query, List<UUID> documentIds, UUID sessionId) {
-        List<String> sortedIds = documentIds.stream().map(UUID::toString).sorted().toList();
-        String raw = userId
-                + "|" + query.trim().toLowerCase(Locale.ROOT)
-                + "|" + String.join(",", sortedIds)
-                + "|" + (sessionId == null ? "no-session" : sessionId.toString());
-        return CACHE_PREFIX + sha256(raw);
-    }
-
-    private String sha256(String value) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(value.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder();
-            for (byte b : hash) {
-                hex.append(String.format("%02x", b));
-            }
-            return hex.toString();
-        } catch (Exception ex) {
-            throw new AppException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to build cache key");
-        }
-    }
-
-    private void cache(String key, QueryResponse response) {
-        try {
-            redisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(response), Duration.ofHours(cacheTtlHours));
-        } catch (JsonProcessingException ex) {
-            throw new AppException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to cache query response");
-        }
-    }
-
-    private QueryResponse deserialize(String payload) {
-        try {
-            return objectMapper.readValue(payload, QueryResponse.class);
-        } catch (JsonProcessingException ex) {
-            log.warn("Failed to parse cached response, cache entry will be ignored", ex);
-            return null;
-        }
-    }
-
     private void persistResponse(User user, ChatSession session, String query, String answer) {
         chatHistoryService.save(user, query, answer);
         if (session != null) {
             chatMemoryService.saveTurn(session, query, answer);
-        }
-    }
-
-    private UUID parseUuid(String raw) {
-        try {
-            return UUID.fromString(raw);
-        } catch (Exception ignored) {
-            return null;
         }
     }
 
@@ -279,5 +212,33 @@ public class QueryService {
             return text;
         }
         return text.substring(0, maxChars) + "...";
+    }
+
+    private void logStructured(
+            UUID queryId,
+            User user,
+            UUID sessionId,
+            List<UUID> documentIds,
+            long retrievalMs,
+            long llmMs,
+            boolean cacheHit,
+            int responseSize,
+            long totalTimeMs
+    ) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("queryId", queryId);
+        payload.put("userId", user.getId());
+        payload.put("sessionId", sessionId);
+        payload.put("documentIds", documentIds);
+        payload.put("retrievalTime", retrievalMs);
+        payload.put("llmTime", llmMs);
+        payload.put("cacheHit", cacheHit);
+        payload.put("responseSize", responseSize);
+        payload.put("totalTime", totalTimeMs);
+        try {
+            log.info(objectMapper.writeValueAsString(payload));
+        } catch (Exception ex) {
+            log.info("queryId={}, userId={}, cacheHit={}", queryId, user.getId(), cacheHit);
+        }
     }
 }
